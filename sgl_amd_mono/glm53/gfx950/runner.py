@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import inspect
 import os
+from functools import partial
 from pathlib import Path
 from typing import Optional
 
@@ -111,21 +112,12 @@ class Glm53Step(msgspec.Struct, frozen=True):
 
 
 def compile_only(launch) -> None:
-    """Compile a launch for this process without running it (FlyDSL's compile-only
-    mode, for the one call); the first real call then only loads the code."""
-    from flydsl.utils.env import CompileEnvManager
+    """Build the launcher without dispatching its kernels."""
+    # AITER probes the GPU when imported; test/unit imports this module on CPU
+    from aiter.ops.flydsl.kernels.tensor_shim import _preload_compiled
 
     names = [n for n in inspect.signature(launch.func).parameters if n != "stream"]
-    var = CompileEnvManager.options["compile_only"].env_var
-    old = os.environ.get(var)
-    os.environ[var] = "1"
-    try:
-        launch(*([0] * len(names)), stream=torch.cuda.current_stream())
-    finally:
-        if old is None:
-            os.environ.pop(var, None)
-        else:
-            os.environ[var] = old
+    _preload_compiled(launch, *([0] * len(names)), torch.cuda.current_stream())
 
 
 def ensure_writable_flydsl_cache() -> None:
@@ -144,6 +136,8 @@ class Glm53Runtime:
     is the step epoch (``advance_step``)."""
 
     def __init__(self, key: Glm53Build, rank: int, group, device: torch.device):
+        from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
+
         from sgl_amd_mono.common import guard
         from sgl_amd_mono.common.peer import PeerBuffer
 
@@ -186,6 +180,7 @@ class Glm53Runtime:
             fault_after=key.fault_after,
             stop=key.stop,
         )
+        self.dispatch = partial(_run_compiled, self.launch)
         self.peer = PeerBuffer(self.sy["_bytes"], group, rank, key.tp, device)
         self.peer.bytes.zero_()
         self.scratch = torch.zeros(self.sc["_bytes"], dtype=torch.uint8, device=device)
@@ -273,7 +268,7 @@ class Glm53LayerOp:
             )
         x_out = rt.outs[self.layer % 2]
         p = lambda t: t.data_ptr()  # noqa: E731
-        rt.launch(
+        rt.dispatch(
             p(h),
             p(x_out),
             p(step.positions),
@@ -316,6 +311,6 @@ class Glm53LayerOp:
             rt.rank,
             self.layer,
             pt.stride(0),
-            stream=torch.cuda.current_stream(),
+            torch.cuda.current_stream(),
         )
         return x_out
