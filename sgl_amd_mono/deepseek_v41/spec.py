@@ -231,7 +231,7 @@ SGLANG_READS = {
     "srt/layers/engram.py": (
         "layer_hash_index",
         "forward(cp_all_tokens)",
-        "forward(input_ids)",
+        "Engram.forward(input_ids)",
         "image_token_id",
         "engram_gate",
         "engram_gate(input_ids)",
@@ -1008,8 +1008,8 @@ class _Built:
                         engram.k_weight,
                         engram.eps,
                         engram.clamp_value,
-                        image_ids,
-                        engram.image_token_id,
+                        input_ids=image_ids,
+                        image_token_id=engram.image_token_id,
                     )
                 pending = (None, residual, None, None)
             # an Engram layer reads the settled residual: no post owed into it
