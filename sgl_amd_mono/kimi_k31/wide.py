@@ -219,30 +219,48 @@ def _say(msg):
         print(f"[k31 wide] {msg}", flush=True)
 
 
-def _launch_sort(b) -> bool:
-    """Bucket b's launches also make the routed experts' sort + mxfp8 quant + output zeroing
-    (``SGLANG_AMD_MONO_K31_WIDE_LAUNCH_SORT=1``, needs ``..._LAUNCH_TOPK=1``): SGLang's small-sort range only."""
+def _launch_sort(b):
+    """The sort kind bucket b's launches also make (with the output zeroing), or None
+    (``SGLANG_AMD_MONO_K31_WIDE_LAUNCH_SORT=1``, needs ``..._LAUNCH_TOPK=1``; m <= 64):
+    "aux16" (aiter's BM16 aux sort, handed over by ``aiter.presorted_moe.register_presorted_moe``) when aiter
+    has that API, else "sgl" (SGLang's BM32 small sort + mxfp8 quant, ``presort.injected``)."""
+    from sgl_amd_mono.kimi_k31 import presort
     from sgl_amd_mono.kimi_k31.gfx950.stages import moe_front as mf
 
-    return (
+    if not (
         os.environ.get("SGLANG_AMD_MONO_K31_WIDE_LAUNCH_SORT", "1") == "1"
         and os.environ.get("SGLANG_AMD_MONO_K31_WIDE_LAUNCH_TOPK", "1") == "1"
         and b <= mf.SORT_MAX_ROWS
-    )
+    ):
+        return None
+    return presort.sort_kind()
 
 
-def _sort_views(buf, m):
-    """Tensor views of the launch's sort buffer (``moe_front.sort_layout``), as SGLang's small sort returns them."""
+def _sort_views(buf, m, kind="sgl"):
+    """Tensor views of the launch's sort buffer (``moe_front.sort_layout``): as SGLang's small sort returns them
+    ("sgl"), or under ``register_presorted_moe``'s key names ("aux16")."""
     from sgl_amd_mono.kimi_k31.gfx950.stages import moe_front as mf
 
-    ly = mf.sort_layout(m)
+    ly = mf.sort_layout(m, kind)
     o = ly["offs"]
 
     def at(k, n):
         return buf[o[k] : o[k] + n]
 
+    if kind == "aux16":
+        maxp, nblk = ly["maxp"], ly["nblk"]
+        return dict(
+            kind=kind,
+            sorted_token_ids=at("ids", 4 * maxp).view(torch.int32),
+            sorted_weights=at("w", 4 * maxp).view(torch.float32),
+            sorted_expert_ids=at("eids", 4 * nblk).view(torch.int32),
+            num_valid_ids=at("nv", 8).view(torch.int32),
+            m_indices=at("mi", 4 * maxp).view(torch.int32),
+            reverse_sorted=at("dest", 4 * m * mf.TOPK).view(torch.int32),
+        )
     maxp, nblk, srows = ly["maxp"], ly["nblk"], ly["srows"]
     return dict(
+        kind=kind,
         ids=at("ids", 4 * maxp).view(torch.int32),
         w=at("w", 4 * maxp).view(torch.float32),
         eids=at("eids", 4 * nblk).view(torch.int32),
@@ -329,13 +347,19 @@ def _experts(moe, lat, ids, w, out, sortv):
             if sortv is not None:
                 from sgl_amd_mono.kimi_k31 import presort
 
-                inj = es.enter_context(presort.injected(sortv, ids.shape[0], ids, out))
+                cm = (
+                    presort.registered(sortv, ids, w, out)
+                    if sortv["kind"] == "aux16"
+                    else presort.injected(sortv, ids.shape[0], ids, out)
+                )
+                inj = es.enter_context(cm)
             with set_moe_output(out):
                 y = moe.experts(lat, topk_output)
             if inj is not None and not getattr(moe, "_k31_sort_said", False):
                 moe._k31_sort_said = True
                 _say(
-                    f"launch sort {'on' if inj['used'] else 'NOT used'} (layer {moe.layer_idx})"
+                    f"launch sort {sortv['kind']} {'on' if inj['used'] else 'NOT used'} "
+                    f"(layer {moe.layer_idx})"
                 )
     finally:
         clear()
@@ -605,12 +629,13 @@ class Wide:
         # the launch's sort + quant (sort builds); a placeholder pointer otherwise
         from sgl_amd_mono.kimi_k31.gfx950.stages import moe_front as mf
 
-        if _launch_sort(b):
+        kind = _launch_sort(b)
+        if kind:
             bufs["sort"] = torch.zeros(
-                mf.sort_layout(b)["nbytes"], dtype=torch.uint8, device=dev
+                mf.sort_layout(b, kind)["nbytes"], dtype=torch.uint8, device=dev
             )
-            mf.sort_init(bufs["sort"], b)
-            bufs["sortv"] = _sort_views(bufs["sort"], b)
+            mf.sort_init(bufs["sort"], b, kind)
+            bufs["sortv"] = _sort_views(bufs["sort"], b, kind)
         else:
             bufs["sort"] = torch.zeros(256, dtype=torch.uint8, device=dev)
             bufs["sortv"] = None
